@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.
 # SPDX-License-Identifier: BSD-3-Clause
 
+import os
 import struct
 from abc import ABC, abstractmethod
 from typing import BinaryIO, Callable, Generator, Optional, Tuple
@@ -176,7 +177,7 @@ class BinIdxReader(SamplePartFileReader[FilteredSample]):
             self._idx_reader = IdxReader(idx_path)
 
         try:
-            # Keep .bin file open for seek+read per sample (no mmap needed)
+            # Keep .bin file open for positional reads per sample (no mmap needed)
             self._bin_file = self.bin_path.open("rb")
         except:
             self._idx_reader.close()
@@ -199,13 +200,19 @@ class BinIdxReader(SamplePartFileReader[FilteredSample]):
         if self.sample_filter is not None and not self.sample_filter(key):
             return None
 
-        # Read token data from .bin via seek+read
         byte_offset = self._idx_reader.pointer(idx)
         length = self._idx_reader.length(idx)
         byte_length = length * self._idx_reader.dtype_size
 
-        self._bin_file.seek(byte_offset)
-        token_bytes = self._bin_file.read(byte_length)
+        if self.bin_path.is_local():
+            # DataLoader workers inherit the same open file description after fork. A
+            # positional read avoids racing on its shared seek offset.
+            token_bytes = os.pread(self._bin_file.fileno(), byte_length, byte_offset)
+        else:
+            self._bin_file.seek(byte_offset)
+            token_bytes = self._bin_file.read(byte_length)
+        if len(token_bytes) != byte_length:
+            raise OSError(f"Short bin-idx read for {self.bin_path}[{idx}]")
 
         source_info = SourceInfo(
             dataset_path=self.bin_path,

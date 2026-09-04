@@ -32,6 +32,7 @@ from megatron.energon import (
 from megatron.energon.dataset_config import load_config
 from megatron.energon.epathlib import EPath
 from megatron.energon.flavors import Sample
+from megatron.energon.flavors.binidx.binidx_reader import BinIdxReader
 from megatron.energon.recipe.recipe import Recipe
 
 # Speed up tests significantly by reducing the torch status check interval for broken worker shutdown
@@ -119,6 +120,47 @@ class TestBinIdxDataset(unittest.TestCase):
             f.write(doc_indices.tobytes())
 
         return bin_path
+
+    def test_reader_uses_positional_reads_without_changing_file_offset(self):
+        bin_path = self.create_binidx_dataset(
+            self.dataset_path / "positional_reads",
+            num_docs=3,
+            doc_len=4,
+            token_start=10,
+        )
+        reader = BinIdxReader(EPath(bin_path))
+        try:
+            # Forked workers share this open-file offset. Positional reads must leave it untouched.
+            reader._bin_file.seek(1)
+            initial_offset = reader._bin_file.tell()
+
+            token_bytes, _ = reader["2.tokens"]
+
+            self.assertEqual(reader._bin_file.tell(), initial_offset)
+            np.testing.assert_array_equal(
+                np.frombuffer(token_bytes, dtype=np.int32),
+                np.arange(18, 22, dtype=np.int32),
+            )
+        finally:
+            reader.close()
+            reader._idx_reader.close()
+
+    def test_reader_rejects_short_positional_read(self):
+        bin_path = self.create_binidx_dataset(
+            self.dataset_path / "short_read",
+            num_docs=2,
+            doc_len=4,
+        )
+        with open(bin_path, "r+b") as bin_file:
+            bin_file.truncate(bin_path.stat().st_size - np.dtype(np.int32).itemsize)
+
+        reader = BinIdxReader(EPath(bin_path))
+        try:
+            with self.assertRaisesRegex(OSError, "Short bin-idx read"):
+                reader[1]
+        finally:
+            reader.close()
+            reader._idx_reader.close()
 
     def test_get_train_dataset_iterates_expected_tokens(self):
         torch.manual_seed(42)

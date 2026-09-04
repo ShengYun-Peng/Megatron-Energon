@@ -369,6 +369,35 @@ class TestJsonlDataset(unittest.TestCase):
             str(i) for i in range(7)
         ]
 
+    def test_prepared_jsonl_shard_directory_restores_sample(self):
+        shard_dir = self.dataset_path / "jsonl_shards_restore"
+        shard_dir.mkdir()
+        self.create_text_test_dataset(
+            shard_dir / "shard_0.jsonl", range(0, 3), range(0, 3), prepare=False
+        )
+        self.create_text_test_dataset(
+            shard_dir / "shard_1.jsonl", range(3, 7), range(3, 7), prepare=False
+        )
+        self.prepare_jsonl_shard_dir(shard_dir)
+
+        worker_config = WorkerConfig(rank=0, world_size=1, num_workers=0)
+        worker_config.worker_activate(0)
+        try:
+            factory = DefaultCrudeJsonlShardListDatasetFactory(
+                EPath(shard_dir),
+                training=False,
+                worker_config=worker_config,
+                split_part="train",
+            )
+            dataset = factory.build()
+            sample = next(iter(dataset))
+            restored = dataset.restore_sample(sample["__restore_key__"])
+
+            assert restored["json"] == sample["json"]
+            assert restored["__restore_key__"] == sample["__restore_key__"]
+        finally:
+            worker_config.worker_deactivate()
+
     def test_prepared_jsonl_shard_directory_multirank(self):
         shard_dir = self.dataset_path / "jsonl_shards_multirank"
         shard_dir.mkdir()

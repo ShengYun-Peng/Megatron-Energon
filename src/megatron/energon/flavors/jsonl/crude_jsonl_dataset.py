@@ -171,6 +171,7 @@ class CrudeJsonlShardListDatasetFactory(
             part_filter=part_filter,
             filter_name=filter_name,
         )
+        self.restore_key_kind = "JsonlShardList"
         self.jsonl_paths = [shard.path for shard in self.shards]
 
     def _validate_manifest_meta(self, meta: ShardListMeta) -> None:

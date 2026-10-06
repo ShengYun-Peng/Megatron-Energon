@@ -171,14 +171,11 @@ def handle_restore_errors(
             raise ValueError(f"Unexpected skip sample {sample} during restoration.") from e
         except Exception as e:
             error_handler(e, sample, get_source_info(sample))
-    except GeneratorExit as e:
-        # Unexpected skip sample
-        try:
-            raise ValueError(
-                f"Unexpected generator early stopping for sample {sample} during restoration."
-            ) from e
-        except Exception as e:
-            error_handler(e, sample, get_source_info(sample))
+    except GeneratorExit:
+        # A downstream consumer may intentionally close a partially consumed restore iterator
+        # (for example, when an encoder-prefetch queue is torn down at job exit). GeneratorExit
+        # represents that consumer-driven close, not a failed sample restoration.
+        raise
     except SYSTEM_EXCEPTIONS as e:
         raise FatalSampleError.from_sample(sample) from e
     except Exception as e:

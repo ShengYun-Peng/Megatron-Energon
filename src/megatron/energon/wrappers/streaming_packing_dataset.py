@@ -212,17 +212,12 @@ class StreamingPackingDataset(
 
         encoded_pack = []
         for sample in pack:
-            input_restore_key = get_sample_restore_key(sample)
             with self._sample_encoder_failure_handler.handle_errors(sample):
                 with self._sample_encoder_sample_index.ctx() as encode_idx:
                     encoded_sample = self.sample_encoder(sample)
                 assert not isinstance(encoded_sample, Generator), "Generator not supported"
-                if isinstance(sample, PartialSample) and input_restore_key is not None:
-                    encoded_sample = set_sample_restore_key(
-                        encoded_sample,
-                        *input_restore_key[1:],
-                        src=sample,
-                    )
+                if isinstance(sample, PartialSample):
+                    encoded_sample = sample.propagate_restore_key(encoded_sample)
                 self._sample_encoder_failure_handler.reset()
                 encoded_pack.append(
                     add_sample_restore_key(
@@ -335,16 +330,11 @@ class StreamingPackingDataset(
             if self.sample_encoder is not None:
                 with handle_restore_errors(self.worker_config.restore_error_handler, sample):
                     input_sample = sample
-                    input_restore_key = get_sample_restore_key(input_sample)
                     with self._sample_encoder_sample_index.ctx(sample_idx):
                         sample = self.sample_encoder(sample)
                     assert not isinstance(sample, Generator), "Generator not supported"
-                    if isinstance(input_sample, PartialSample) and input_restore_key is not None:
-                        sample = set_sample_restore_key(
-                            sample,
-                            *input_restore_key[1:],
-                            src=input_sample,
-                        )
+                    if isinstance(input_sample, PartialSample):
+                        sample = input_sample.propagate_restore_key(sample)
                     sample = add_sample_restore_key(sample, sample_idx, src=self)
 
             pack.append(sample)

@@ -53,6 +53,42 @@ class PartialSample(Generic[T_sample, T_slice]):
         if inner_restore_key is not None:
             set_sample_restore_key(self, inner_restore_key, self.slice, src=self)
 
+    @classmethod
+    def reslice(
+        cls,
+        sample: Union[T_sample, "PartialSample[T_sample, T_slice]"],
+        sample_slice: T_slice,
+    ) -> "PartialSample[T_sample, T_slice]":
+        """Create a flat view while preserving the current sample's restore provenance.
+
+        Packing selectors may split an already-partial sample again. The new slice remains
+        relative to the original base sample, but restoring it must first replay the dataset
+        wrapper that produced the current partial sample.
+        """
+        restore_key = get_sample_restore_key(sample)
+        base_sample = sample
+        while isinstance(base_sample, PartialSample):
+            base_sample = base_sample.sample
+        partial = cls(sample=base_sample, slice=sample_slice)
+        if restore_key is not None:
+            set_sample_restore_key(partial, restore_key, sample_slice, src=partial)
+        return partial
+
+    def propagate_restore_key(self, sample: Any) -> Any:
+        """Copy this view's exact restore key to a derived sample.
+
+        A wrapper may have replaced the key's leading dataset type, so rebuilding it from
+        ``type(self)`` would lose that outer provenance.
+        """
+        restore_key = get_sample_restore_key(self)
+        if restore_key is None:
+            return sample
+        if isinstance(sample, dict) and "__restore_key__" in sample:
+            sample["__restore_key__"] = restore_key
+        elif hasattr(sample, "__restore_key__"):
+            sample.__restore_key__ = restore_key
+        return sample
+
 
 class SavablePartialSampleBuffer(
     SavableSampleBuffer[T_sample | PartialSample[T_sample, T_slice]],
@@ -67,9 +103,9 @@ class SavablePartialSampleBuffer(
             and restore_key[0] == PartialSample.__name__
         ):
             _, sample_restore_key, sample_slice = restore_key
-            return PartialSample(
-                sample=self.restore_sample(sample_restore_key),
-                slice=sample_slice,
+            return PartialSample.reslice(
+                self.restore_sample(sample_restore_key),
+                sample_slice,
             )
         return self.dataset.restore_sample(restore_key)
 
@@ -316,17 +352,12 @@ class PackingDataset(
                 return pack
             encoded_pack = []
             for sample in pack:
-                input_restore_key = get_sample_restore_key(sample)
                 with self._sample_encoder_failure_handler.handle_errors(sample):
                     with self._sample_encoder_sample_index.ctx() as encode_idx:
                         encoded_sample = self.sample_encoder(sample)
                     assert not isinstance(encoded_sample, Generator), "Generator not supported"
-                    if isinstance(sample, PartialSample) and input_restore_key is not None:
-                        encoded_sample = set_sample_restore_key(
-                            encoded_sample,
-                            *input_restore_key[1:],
-                            src=sample,
-                        )
+                    if isinstance(sample, PartialSample):
+                        encoded_sample = sample.propagate_restore_key(encoded_sample)
                     self._sample_encoder_failure_handler.reset()
                     encoded_pack.append(
                         add_sample_restore_key(
@@ -506,16 +537,11 @@ class PackingDataset(
             if self.sample_encoder is not None:
                 with handle_restore_errors(self.worker_config.restore_error_handler, sample):
                     input_sample = sample
-                    input_restore_key = get_sample_restore_key(input_sample)
                     with self._sample_encoder_sample_index.ctx(sample_idx):
                         sample = self.sample_encoder(sample)
                     assert not isinstance(sample, Generator), "Generator not supported"
-                    if isinstance(input_sample, PartialSample) and input_restore_key is not None:
-                        sample = set_sample_restore_key(
-                            sample,
-                            *input_restore_key[1:],
-                            src=input_sample,
-                        )
+                    if isinstance(input_sample, PartialSample):
+                        sample = input_sample.propagate_restore_key(sample)
                     sample = add_sample_restore_key(sample, sample_idx, src=self)
 
             pack.append(sample)

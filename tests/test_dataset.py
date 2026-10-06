@@ -2029,6 +2029,33 @@ class TestDataset(unittest.TestCase):
         )
         assert_segments(final_packer_samples)
 
+    def test_partial_sample_reslice_preserves_outer_restore_key(self):
+        """Re-splitting a partial sample keeps the wrapper that produced it restorable."""
+        base_sample = EncodedCaptioningSample(
+            __key__="base",
+            __restore_key__=("MapDataset", 8),
+            image=torch.zeros((3, 1, 1)),
+            caption=torch.arange(10),
+        )
+        fragment = PartialSample(sample=base_sample, slice=(0, 8))
+        fragment.__restore_key__ = (
+            "IterMapDataset",
+            3,
+            0,
+            "MapDataset",
+            8,
+        )
+
+        suffix = PartialSample.reslice(fragment, (5, 8))
+
+        assert suffix.sample is base_sample
+        assert suffix.slice == (5, 8)
+        assert suffix.__restore_key__ == (
+            "PartialSample",
+            fragment.__restore_key__,
+            (5, 8),
+        )
+
     def test_stream_packing(self):
         """Streaming packing pulls just enough samples for one pack and carries remainders."""
 

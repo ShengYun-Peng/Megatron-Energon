@@ -61,6 +61,7 @@ from megatron.energon.tools.info import command as info_command
 from megatron.energon.tools.lint import command as lint_command
 from megatron.energon.tools.prepare import command as prepare_command
 from megatron.energon.tools.preview import command as preview_command
+from megatron.energon.wrappers.iter_map_dataset import IterMapDataset
 from tests.epath_s3_emulator import setup_s3_emulator
 
 # Speed up tests significantly by reducing the torch status check interval for broken worker shutdown
@@ -2055,6 +2056,79 @@ class TestDataset(unittest.TestCase):
             fragment.__restore_key__,
             (5, 8),
         )
+
+    def test_iter_map_restore_multiple_outputs_per_input(self):
+        """Every output from one inner sample retains the inputs needed for replay."""
+
+        class MultiYieldTaskEncoder(DefaultTaskEncoder):
+            @stateless
+            def encode_sample(self, sample: CaptioningSample) -> EncodedCaptioningSample:
+                return EncodedCaptioningSample.derive_from(
+                    sample,
+                    image=sample.image,
+                    caption=torch.frombuffer(bytearray(sample.caption.encode()), dtype=torch.uint8),
+                )
+
+            @stateless
+            def split_stream(
+                self, samples: Iterator[EncodedCaptioningSample]
+            ) -> Iterator[EncodedCaptioningSample]:
+                for sample in samples:
+                    midpoint = max(1, len(sample.caption) // 2)
+                    yield EncodedCaptioningSample.derive_from(
+                        sample,
+                        __key__=f"{sample.__key__}:first",
+                        image=sample.image,
+                        caption=sample.caption[:midpoint],
+                    )
+                    yield EncodedCaptioningSample.derive_from(
+                        sample,
+                        __key__=f"{sample.__key__}:second",
+                        image=sample.image,
+                        caption=sample.caption[midpoint:],
+                    )
+
+            def build_encode_sample(
+                self, dataset, *, worker_config: WorkerConfig
+            ) -> IterMapDataset:
+                return IterMapDataset(
+                    super().build_encode_sample(dataset, worker_config=worker_config),
+                    self.split_stream,
+                    stateless_iter_fn=True,
+                    worker_config=worker_config,
+                )
+
+        def build_loader():
+            return get_savable_loader(
+                get_train_dataset(
+                    self.dataset_path,
+                    batch_size=None,
+                    packing_buffer_size=None,
+                    worker_config=no_worker_config,
+                    virtual_epoch_length=2,
+                    shuffle_buffer_size=None,
+                    max_samples_per_sequence=None,
+                    task_encoder=MultiYieldTaskEncoder(),
+                )
+            )
+
+        loader = build_loader()
+        loader_iter = iter(loader)
+        first = next(loader_iter)
+        state = loader.save_state_rank()
+        second = next(loader_iter)
+
+        assert first.__key__.endswith(":first")
+        assert second.__key__.endswith(":second")
+        restored = loader.restore_sample(second.__restore_key__)
+        assert restored.__key__ == second.__key__
+        assert torch.equal(restored.caption, second.caption)
+
+        restored_loader = build_loader()
+        restored_loader.restore_state_rank(state)
+        restored_second = next(iter(restored_loader))
+        assert restored_second.__key__ == second.__key__
+        assert torch.equal(restored_second.caption, second.caption)
 
     def test_stream_packing(self):
         """Streaming packing pulls just enough samples for one pack and carries remainders."""

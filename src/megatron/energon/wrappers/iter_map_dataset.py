@@ -38,8 +38,10 @@ class IterMapDataset(BaseWrapperDataset[T_sample, T_sample_out], Generic[T_sampl
     iter_map_fn_config: Optional[Union[Dict[str, Any], Callable[[], Dict[str, Any]]]]
     _sample_index: SampleIndex
     _iter_map_failure_handler: ErrorContext
+    _pending_restore_keys: list[tuple]
+    _pending_iter_idx: int
 
-    _savable_fields = ("_sample_index",)
+    _savable_fields = ("_sample_index", "_pending_restore_keys", "_pending_iter_idx")
 
     def __init__(
         self,
@@ -84,44 +86,76 @@ class IterMapDataset(BaseWrapperDataset[T_sample, T_sample_out], Generic[T_sampl
 
     def reset_state_own(self) -> None:
         self._sample_index = SampleIndex(self.worker_config, src=self)
+        self._pending_restore_keys = []
+        self._pending_iter_idx = 0
 
     def len_worker(self, worker_idx: int | None = None) -> int:
         return self.len_map_fn(self.dataset.len_worker(worker_idx))
 
     def __iter__(self) -> Iterator[T_sample_out]:
+        if self._pending_restore_keys:
+            to_be_mapped = tuple(
+                self.dataset.restore_sample(restore_key)
+                for restore_key in self._pending_restore_keys
+            )
+            with handle_restore_errors(self.worker_config.restore_error_handler, to_be_mapped):
+                pending_iter = iter(self.iter_map_fn(iter(to_be_mapped)))
+                try:
+                    for _ in range(self._pending_iter_idx):
+                        next(pending_iter)
+                    while True:
+                        with self._sample_index.ctx() as sample_idx:
+                            sample = next(pending_iter)
+                        iter_idx = self._pending_iter_idx
+                        self._pending_iter_idx += 1
+                        yield set_sample_restore_key(
+                            sample,
+                            sample_idx,
+                            iter_idx,
+                            *self._pending_restore_keys,
+                            src=self,
+                        )
+                except StopIteration:
+                    pass
+                finally:
+                    if hasattr(pending_iter, "close"):
+                        pending_iter.close()
+            self._pending_restore_keys.clear()
+            self._pending_iter_idx = 0
+
         last_sample_wrapper = _LastSampleWrapper(self.dataset)
         # The iter_map_fn is stateless. Thus we need to know which inner sample created the
         # outer sample, and the relative outer sample index, so we can restore it.
 
-        # This is the sample index within the currently yielded sample
-        iter_idx = 0
-        sample_idx = 0
-        sample_restore_keys = []
-
         def reset_idx_iter() -> Generator[T_sample, None, None]:
             # Resets the inner sample index
-            nonlocal iter_idx, sample_restore_keys
             for entry in last_sample_wrapper:
-                iter_idx = 0
-                sample_restore_keys.append(get_sample_restore_key(entry))
+                # If the mapper consumed a new input after yielding output, start a new
+                # replay group. If it yields multiple outputs from one input, retain the
+                # same input restore keys and advance iter_idx for deterministic replay.
+                if self._pending_iter_idx > 0:
+                    self._pending_iter_idx = 0
+                    self._pending_restore_keys.clear()
+                self._pending_restore_keys.append(get_sample_restore_key(entry))
                 yield entry
 
         ds_iter = iter(reset_idx_iter())
 
         # While True will break when the inner dataset is exhausted, but may continue on exception
         while True:
-            iter_idx = 0
             with self._iter_map_failure_handler.handle_errors(last_sample_wrapper.last_sample):
                 for sample_idx, sample in self._sample_index.iter_ctx(self.iter_map_fn(ds_iter)):
+                    iter_idx = self._pending_iter_idx
+                    self._pending_iter_idx += 1
                     yield set_sample_restore_key(
                         sample,
                         sample_idx,
                         iter_idx,
-                        *sample_restore_keys,
+                        *self._pending_restore_keys,
                         src=self,
                     )
-                    sample_restore_keys.clear()
-                    iter_idx += 1
+                self._pending_restore_keys.clear()
+                self._pending_iter_idx = 0
                 break
 
     def can_restore_sample(self) -> bool:
